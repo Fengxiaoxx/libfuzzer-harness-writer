@@ -1,167 +1,179 @@
 # libfuzzer-harness-writer
 
-A Claude Code skill (agent instruction set) that guides an AI coding assistant through writing high-quality, non-redundant [LibFuzzer](https://llvm.org/docs/LibFuzzer.html) harnesses for C and C++ libraries.
+A [Claude Code](https://claude.ai/claude-code) skill that writes production-quality
+[LibFuzzer](https://llvm.org/docs/LibFuzzer.html) harnesses for C and C++ libraries —
+covering the full public API surface, avoiding duplication of existing harnesses, and
+passing a compile + smoke-test gate before declaring success.
 
 ---
 
-## What this skill does
+## Why this exists
 
-When activated, the skill walks the assistant through a systematic, seven-step process:
+Writing a fuzzer harness that actually finds bugs is harder than it looks. A naive
+harness often:
 
-1. **Inventory** — export symbols, read headers, find existing harnesses
-2. **Gap analysis** — identify API groups not yet covered by existing harnesses
-3. **Design** — pick the right harness architecture for each uncovered group
-4. **Write** — implement harnesses using the proven patterns in `references/patterns.md`
-5. **Review** — use the Codex MCP tool (if available) or the self-review checklist
-6. **Compile & smoke-test** — must compile with `-fsanitize=fuzzer,address` and survive 5 s without crashes
-7. **Iterate** — fix every finding, recompile, retest
+- Covers only the "happy path", missing the error-handling code where bugs hide
+- Leaks memory or double-frees, producing false positives that drown real findings
+- Uses NUL-delimited string scanning, wasting mutation entropy and confusing libFuzzer's
+  corpus evolution
+- Misses API pairs (case-sensitive vs. case-insensitive, valid vs. OOB index) that are
+  exactly where off-by-one errors live
+- Has no semantic oracle, so logical bugs that don't crash the process go undetected
 
-The skill is designed to produce harnesses that:
-- Maximise code coverage across the full public API surface
-- Never rewrite or duplicate existing harnesses
-- Follow strict memory-safety contracts (no leaks, no double-frees, no use-after-free)
-- Use stable input-consumption patterns (length-prefixed strings, fixed-size op records) so libFuzzer's corpus evolution stays productive
-- Include semantic oracles that catch logical bugs, not just crashes
+This skill gives Claude a systematic, seven-step process and a library of proven code
+patterns to avoid all of the above.
 
 ---
 
-## When to use this skill
+## Installation
 
-Trigger this skill whenever:
-- A user wants to **write**, **improve**, or **generate** LibFuzzer fuzz drivers / harnesses
-- Keywords like `fuzz`, `fuzzing`, `harness`, `fuzz driver`, `libfuzzer`, `afl`, `oss-fuzz`, `coverage` appear
-- A user has a compiled library (`.so` / `.a`) and wants to find bugs via fuzzing
-- A user asks to "improve fuzzing coverage", "add more fuzz targets", or "write libfuzzer tests"
-- A user working with a C/C++ library mentions **security** or **robustness testing**
+Copy the skill into Claude Code's skill directory, then restart Claude Code:
 
----
-
-## Repository structure
-
-```
-libfuzzer-harness-writer/
-├── SKILL.md                     # Skill definition read by the AI assistant
-├── references/
-│   ├── patterns.md              # Copy-paste-ready C code templates
-│   ├── checklist.md             # Pre-submission quality checklist
-│   └── examples/                # Real harnesses for cJSON (reference implementations)
-│       ├── cjson_builder_fuzzer.c
-│       ├── cjson_mutate_fuzzer.c
-│       └── cjson_ops_fuzzer.c
-└── scripts/
-    ├── compile_fuzz.sh          # Compile one harness with ASan + libFuzzer
-    ├── smoke_test.sh            # Run the binary for 5 s and check health
-    └── export_symbols.sh        # List exported functions from a .so
+```bash
+git clone git@github.com:Fengxiaoxx/libfuzzer-harness-writer.git \
+    ~/.claude/skills/libfuzzer-harness-writer
 ```
 
+Claude Code will automatically detect and load the skill. It triggers whenever you
+mention fuzzing, harnesses, LibFuzzer, AFL, OSS-Fuzz, or ask about security / robustness
+testing for a C/C++ library.
+
 ---
 
-## Quick start
+## How to invoke it
 
-### 1. Export the public API of your library
+Just describe your task in plain language:
+
+```
+Write LibFuzzer harnesses for libpng. The library is at build/libpng.a and
+headers are in include/. There's already a harness for png_read_png in
+fuzzing/read_fuzzer.c — don't touch that one.
+```
+
+Claude will run the full seven-step workflow automatically.
+
+---
+
+## The seven-step workflow
+
+```
+1. Inventory     Export symbols, read headers, list existing harnesses
+      │
+2. Gap analysis  Subtract covered APIs → group remainder by functional area
+      │
+3. Design        Choose input format per group (raw / multi-region / op-records)
+      │
+4. Write         Implement using the patterns in references/patterns.md
+      │
+5. Review        Codex MCP review if available; otherwise references/checklist.md
+      │
+6. Compile       clang -fsanitize=fuzzer,address -Wall -Wextra -Werror (zero warnings)
+      │
+7. Smoke-test    Run 5 s, verify no crashes, throughput > 1000 exec/s
+```
+
+Steps 6 and 7 use the bundled scripts (see below). Claude reruns from step 4 until
+the harness passes both gates.
+
+---
+
+## Bundled scripts
+
+### `scripts/export_symbols.sh` — Step 1
+
+List every exported function from a shared library:
 
 ```bash
 bash scripts/export_symbols.sh path/to/library.so
 ```
 
-This prints every exported function, sorted alphabetically.
+### `scripts/compile_fuzz.sh` — Step 6
 
-### 2. Write a harness
-
-Follow the seven-step process in `SKILL.md`. Use `references/patterns.md` for the concrete C templates (consumer, length-prefixed strings, multi-region splitting, fixed-size op records, semantic oracles, etc.).
-
-### 3. Compile
+Compile a harness with LibFuzzer + AddressSanitizer:
 
 ```bash
-bash scripts/compile_fuzz.sh my_harness.c path/to/library.a path/to/include /tmp/my_harness
+bash scripts/compile_fuzz.sh harness.c library.a include/ /tmp/harness_bin
 ```
 
-The script uses:
-```
-clang -fsanitize=fuzzer,address -O1 -g -Wall -Wextra -Werror
-```
+Flags used: `-fsanitize=fuzzer,address -O1 -g -Wall -Wextra -Werror`
 
-A zero-warning build is required.
+### `scripts/smoke_test.sh` — Step 7
 
-### 4. Smoke-test
+Run the binary for a configurable duration and check health:
 
 ```bash
-bash scripts/smoke_test.sh /tmp/my_harness [corpus_dir] [seconds]
+bash scripts/smoke_test.sh /tmp/harness_bin [corpus_dir] [seconds]
 ```
 
-Default runtime is 5 seconds. The script checks for crashes/sanitizer errors and reports throughput. A healthy harness runs at **> 1 000 exec/s**.
+Default: 5 seconds. Exit 0 = pass (no crash, throughput ≥ 1000 exec/s).
 
 ---
 
-## Key design rules
+## Key patterns the skill uses
 
-### Memory safety (non-negotiable)
+The full templates live in [`references/patterns.md`](references/patterns.md).
+Here is what sets the generated harnesses apart from naive ones:
 
-| Situation | Rule |
+**Length-prefixed strings** instead of NUL scanning
+> Reads a 1-byte length prefix then exactly that many bytes. This keeps
+> libFuzzer's mutation budget predictable and corpus evolution stable.
+
+**Multi-region input splitting**
+> A short byte header splits the payload into N independent regions, one per
+> functional group. Mutations to region A do not shift the byte offsets of
+> region B.
+
+**Fixed-size op records** (for mutation/query harnesses)
+> Each operation is exactly K bytes. The first byte is `n_ops`; the rest are
+> `n_ops × K` bytes of records. Frame-shift mutations never corrupt unrelated
+> operations.
+
+**Semantic oracles**
+> Assertions that catch logical bugs, not just crashes. Two examples:
+> - *Deep-copy oracle*: a deep duplicate of a parsed object must compare equal
+>   to the original.
+> - *Round-trip text oracle*: `print(parse(print(X))) == print(X)` — fires
+>   with `__builtin_trap()` so ASan reports it as a crash.
+
+---
+
+## Reference examples
+
+The [`references/examples/`](references/examples/) directory contains three
+production-quality harnesses written for [cJSON](https://github.com/DaveGamble/cJSON),
+demonstrating every pattern in the skill:
+
+| File | Patterns demonstrated |
 |---|---|
-| `malloc` / `Create*` | Must have a matching `free` / `Delete` on every exit path |
-| `AddItemToArray/Object` succeeds | Item is **owned by the container** — do NOT free it |
-| `AddItemToArray/Object` fails | Caller **must** free the item |
-| Reference containers | Delete containers **before** their referents |
-
-### Input consumption
-
-- Use **length-prefixed strings** (`consume_lstr`) — never NUL-delimited scanning
-- Use **fixed-size op records** for mutation harnesses — prevents frame-shift
-- Use **multi-region splitting** when one harness covers several independent code paths
-
-### Coverage quality
-
-- Test both success **and** failure paths for every API function
-- For index-based functions: valid index, `-1`, `size` (OOB), `INT32_MAX`
-- For case-sensitive/insensitive pairs: test both cases
-- For string setters: correct type, wrong type, NULL argument
-
-### Semantic oracles
-
-```c
-/* Deep-copy oracle (parse-only harnesses) */
-cJSON *dup = cJSON_Duplicate(json, 1);
-if (dup && (!cJSON_Compare(json, dup, 1) || !cJSON_Compare(json, dup, 0)))
-    __builtin_trap();
-cJSON_Delete(dup);
-
-/* Round-trip text oracle (mutation harnesses) */
-char *p1 = cJSON_PrintUnformatted(root);
-if (p1) {
-    cJSON *re = cJSON_Parse(p1);
-    if (!re) __builtin_trap();
-    char *p2 = cJSON_PrintUnformatted(re);
-    if (p2 && strcmp(p1, p2) != 0) __builtin_trap();
-    cJSON_free(p2); cJSON_Delete(re); cJSON_free(p1);
-}
-```
+| `cjson_ops_fuzzer.c` | Raw input, tree walker, type predicates, PrintPreallocated boundary test, deep-copy oracle |
+| `cjson_builder_fuzzer.c` | Multi-region splitting, Consumer struct, typed array constructors, reference lifecycle |
+| `cjson_mutate_fuzzer.c` | Fixed-size op records, TreeIndex, stash-and-reinsert, round-trip oracle |
 
 ---
 
 ## Reference documents
 
-| File | Contents |
+| File | Purpose |
 |---|---|
-| [`SKILL.md`](SKILL.md) | Full step-by-step skill instructions for the AI assistant |
-| [`references/patterns.md`](references/patterns.md) | Nine copy-paste C templates (consumer, strings, splitting, op records, oracles, skeleton, …) |
-| [`references/checklist.md`](references/checklist.md) | Pre-submission checklist covering memory, input, coverage, oracles, compilation, and style |
-| [`references/examples/`](references/examples/) | Three production-quality cJSON harnesses demonstrating all patterns |
+| [`SKILL.md`](SKILL.md) | Full step-by-step instructions loaded by Claude Code |
+| [`references/patterns.md`](references/patterns.md) | Nine copy-paste C templates |
+| [`references/checklist.md`](references/checklist.md) | Pre-submission quality checklist (memory, input, coverage, oracles, style) |
 
 ---
 
 ## Requirements
 
-- **clang** with libFuzzer support (clang 6 or later)
-- **nm** (binutils) for symbol export
+- **clang ≥ 6** with LibFuzzer support
+- **nm** (binutils) — for symbol export
 - A compiled library (`*.a` or `*.so`) and its public headers
 
 ---
 
 ## Output
 
-Harnesses are placed in the project's `fuzzing/` directory alongside any existing harnesses. Each file starts with a header comment that documents:
+Harnesses are placed in the project's `fuzzing/` directory alongside existing
+harnesses. Each file starts with a header comment documenting:
 
 - Which API functions it covers
-- Input byte-layout (single blob / multi-region / op records)
-- Memory safety contract specific to that group
+- The input byte layout (raw / multi-region / op-records)
+- The memory safety contract specific to that functional group
