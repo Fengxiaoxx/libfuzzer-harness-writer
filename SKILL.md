@@ -32,8 +32,23 @@ that maximise code coverage and find real bugs.
 
 ### 1a. Export symbols from the shared library
 
+If a `build_harness/` directory exists at the project root, the shared library
+is already built there — use it directly:
+
 ```bash
-nm -D <library>.so | grep ' T ' | awk '{print $3}' | sort
+nm -D build_harness/lib<name>.so | grep ' T ' | awk '{print $3}' | sort
+```
+
+If `build_harness/` does not exist, build the library first (without sanitizer
+flags — this is just for inspection) and export symbols from the result.
+The pipeline skill (Stage 0) creates `build_harness/` when running the full
+workflow; when using this skill standalone, create it yourself:
+
+```bash
+mkdir -p build_harness && cd build_harness
+cmake <source_dir> -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+nm -D lib<name>.so | grep ' T ' | awk '{print $3}' | sort
 ```
 
 This lists every exported function. Use it to understand the full public API surface.
@@ -137,11 +152,16 @@ See `references/checklist.md` for the complete list. Key items:
 
 ## Step 6 — Compile and smoke-test
 
+Use `build_harness/lib<name>.a` as the library archive for compilation — it is
+the baseline (non-sanitized) build created in Stage 0 of the pipeline, or built
+manually in Step 1a above. Do not rebuild the library here; link against the
+existing artifact.
+
 Use the scripts provided in `scripts/`:
 
 ```bash
-# Compile one harness
-bash scripts/compile_fuzz.sh <harness.c> <library.a> <include_dir> /tmp/<harness_binary>
+# Compile one harness (link against build_harness/lib<name>.a)
+bash scripts/compile_fuzz.sh <harness.c> build_harness/lib<name>.a <include_dir> /tmp/<harness_binary>
 
 # Smoke-test for 5 seconds
 bash scripts/smoke_test.sh /tmp/<harness_binary> [corpus_dir]
