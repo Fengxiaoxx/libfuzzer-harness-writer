@@ -1,6 +1,6 @@
 # libfuzzer-harness-writer
 
-A GitHub Copilot skill (agent instruction set) that guides an AI coding assistant through writing high-quality, non-redundant [LibFuzzer](https://llvm.org/docs/LibFuzzer.html) harnesses for C and C++ libraries.
+A Claude Code skill (agent instruction set) that guides an AI coding assistant through writing high-quality, non-redundant [LibFuzzer](https://llvm.org/docs/LibFuzzer.html) harnesses for C and C++ libraries.
 
 ---
 
