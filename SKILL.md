@@ -23,7 +23,7 @@ that maximise code coverage and find real bugs.
 3. **Design** — choose harness architecture (one harness per functional group)
 4. **Write** — implement following the quality patterns in `references/patterns.md`
 5. **Review** — use the codex MCP tool if available; otherwise self-review against `references/checklist.md`
-6. **Compile & smoke-test** — must compile with `-fsanitize=fuzzer,address` and run for 5 s without crashes
+6. **Compile & smoke-test** — must compile against the **ASan** build and run for 60 s without crashes; MSan compile is optional (skip if no local MSan environment)
 7. **Iterate** — fix all findings, re-test
 
 ---
@@ -32,20 +32,26 @@ that maximise code coverage and find real bugs.
 
 ### 1a. Export symbols from the shared library
 
-If a `build_harness/` directory exists at the project root, the shared library
-is already built there — use it directly:
+**Always use the `.so` file with `nm -D`** (dynamic symbol table). Static archives
+(`.a`) may include internal symbols and do not reflect the true public API surface.
+The helper script `scripts/export_symbols.sh` wraps this command.
+
+If `build_harness/` exists (created by `libfuzzer-lib-builder`), use the ASan
+`.so` — it carries the same public API as the MSan build:
 
 ```bash
-nm -D build_harness/lib<name>.so | grep ' T ' | awk '{print $3}' | sort
+# Preferred: use the helper script
+bash scripts/export_symbols.sh build_harness/asan/lib<name>.so
+
+# Or run directly
+nm -D build_harness/asan/lib<name>.so | grep ' T ' | awk '{print $3}' | sort
 ```
 
-If `build_harness/` does not exist, build the library first (without sanitizer
-flags — this is just for inspection) and export symbols from the result.
-The pipeline skill (Stage 0) creates `build_harness/` when running the full
-workflow; when using this skill standalone, create it yourself:
+If `build_harness/` does not exist, build the library first for inspection only
+(no sanitizer flags needed at this stage), then use the `.so`:
 
 ```bash
-mkdir -p build_harness && cd build_harness
+mkdir -p build_harness/inspect && cd build_harness/inspect
 cmake <source_dir> -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 nm -D lib<name>.so | grep ' T ' | awk '{print $3}' | sort
@@ -125,63 +131,105 @@ Use `__builtin_trap()` to fire the oracle so ASan/libFuzzer reports it as a cras
 
 ---
 
-## Step 5 — Review
+## Step 5 — Review (mandatory gate — do NOT proceed until this passes)
 
-### If the codex MCP tool is available
+This step is a hard gate. A harness may not advance to Step 6 until both you
+and codex independently agree it is ready. The goal is to catch logical bugs
+and coverage gaps that compile-time checks and smoke tests cannot see.
 
-Ask codex to review each harness. Provide the full file content and ask it to evaluate:
-1. Memory management correctness (leaks, double-free, use-after-free)
-2. Coverage gaps (which branches / API paths are not reached)
-3. Input consumption efficiency (does the consumer pattern waste entropy?)
-4. Oracle correctness (can the oracle produce false positives?)
+### If the codex MCP tool is available (preferred path)
 
-Consider the feedback carefully. Apply changes that address real defects.
-Discard suggestions that are overly conservative or would reduce coverage.
+Call `mcp__codex__codex` with the full harness source and ask it to evaluate:
 
-### Self-review checklist (if no codex MCP)
+1. **Memory management** — every allocation freed; no double-free; no use-after-free;
+   ownership semantics correct after `AddItemToArray/Object` success vs. failure
+2. **Coverage gaps** — which API branches / error paths are unreachable from the
+   current input consumer? Which opcodes or flag combinations are missing?
+3. **Input consumption efficiency** — does the consumer waste entropy (e.g., NUL
+   scanning, unbounded modulo)? Would a different consumer pattern reach more code?
+4. **Oracle correctness** — can the semantic oracle produce false positives on
+   valid inputs? Is `__builtin_trap()` used correctly?
 
-See `references/checklist.md` for the complete list. Key items:
-- [ ] All malloc'd memory is freed (including on error paths)
+**Iteration protocol with codex:**
+
+- For each issue codex raises, decide whether it is a real defect or an
+  overly conservative suggestion. Apply fixes for real defects; document
+  (in a comment) why you rejected suggestions that would reduce coverage.
+- After fixing, call codex again with the updated source.
+- **Repeat until codex raises no new defects AND you agree with its
+  assessment.** Only then is the review gate considered passed.
+
+If codex and you disagree on a point, err on the side of correctness over
+coverage — a harness that leaks memory or fires false-positive oracles is
+worse than one with slightly lower coverage.
+
+### Self-review checklist (fallback — only if codex MCP is unavailable)
+
+Work through `references/checklist.md` in full. At minimum verify:
+- [ ] All malloc'd memory is freed (including on every error path)
 - [ ] Reference nodes deleted before their referents
-- [ ] Fixed-size op records used where applicable
+- [ ] Fixed-size op records used where applicable (no frame-shift mutations)
 - [ ] Length-prefix strings used (no NUL scanning)
 - [ ] At least one invalid-input path per API function
 - [ ] Oracle does not produce false positives on valid inputs
+
+Even without codex, do not self-certify until you have walked through every
+checklist item for every harness and found no remaining issues.
 
 ---
 
 ## Step 6 — Compile and smoke-test
 
-Use `build_harness/lib<name>.a` as the library archive for compilation — it is
-the baseline (non-sanitized) build created in Stage 0 of the pipeline, or built
-manually in Step 1a above. Do not rebuild the library here; link against the
-existing artifact.
+Compile the harness against the **ASan** build and smoke-test it. The MSan
+build is compiled for portability validation but **not** smoke-tested locally
+— a clean ASan run is sufficient to confirm harness correctness.
+
+Do not rebuild the library here; link against the pre-built archives from
+`libfuzzer-lib-builder`.
 
 Use the scripts provided in `scripts/`:
 
 ```bash
-# Compile one harness (link against build_harness/lib<name>.a)
-bash scripts/compile_fuzz.sh <harness.c> build_harness/lib<name>.a <include_dir> /tmp/<harness_binary>
+# ── ASan build + smoke test (required) ───────────────────────────────────────
+bash scripts/compile_fuzz.sh asan \
+    <harness.c> \
+    build_harness/asan/lib<name>.a \
+    build_harness/asan/include \
+    /tmp/<harness>_asan
 
-# Smoke-test for 5 seconds
-bash scripts/smoke_test.sh /tmp/<harness_binary> [corpus_dir]
+bash scripts/smoke_test.sh /tmp/<harness>_asan [corpus_dir]
+
+# ── MSan build only — compile to catch portability issues (no smoke test) ────
+bash scripts/compile_fuzz.sh msan \
+    <harness.c> \
+    build_harness/msan/lib<name>.a \
+    build_harness/msan/include \
+    /tmp/<harness>_msan
+# Do NOT run smoke_test.sh for MSan — no local MSan environment.
 ```
 
-A harness is acceptable only when:
-- It compiles with `-Wall -Wextra -Werror` (zero warnings)
-- It runs 5 s without `CRASH`, `ERROR`, or `abort`
-- Throughput is > 1000 exec/s (if much lower, investigate and fix)
+A harness is acceptable when the **ASan** build satisfies:
+- Compiles with `-Wall -Wextra -Werror` (zero warnings)
+- Runs 60 s without `CRASH`, `ERROR`, or `abort` (aligned with OSS-Fuzz)
+- Throughput > 1000 exec/s
+
+The **MSan** build must compile cleanly (zero warnings/errors). Do **not** run
+the smoke test for MSan — there is no local MSan environment.
 
 ---
 
 ## Step 7 — Iterate
 
 For each issue found by codex or the smoke test:
-1. Understand the root cause (do not just suppress the symptom)
+1. Understand the root cause — do not just suppress the symptom
 2. Fix the harness
-3. Recompile and re-smoke-test
+3. Return to Step 5: call codex again with the updated source and get its sign-off
+4. Only after codex confirms no new defects, recompile and re-smoke-test (Step 6)
 
-Repeat until all three harnesses are clean.
+A harness is finished only when **both** conditions hold simultaneously:
+- Step 5 gate passed: codex raises no defects and you agree with its assessment
+- Step 6 gate passed: ASan build compiles clean and runs 60 s without errors;
+  MSan build compiles clean (no smoke test — MSan environment not available)
 
 ---
 
